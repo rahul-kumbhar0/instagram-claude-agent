@@ -1,0 +1,236 @@
+"""FlowCast MCP: Google's Flow models (Gemini Omni video + Nano Banana images) as an MCP server for Claude.
+
+Tools: generate_image, start_video, get_video, list_files, extend_video.
+Generated files are saved on this server and served at /files/<id>.<ext>.
+The MCP endpoint is /mcp/<MCP_SECRET>; keep that URL private.
+"""
+import base64, json, os, secrets, threading, time, uuid, mimetypes
+from pathlib import Path
+
+import httpx
+import uvicorn
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+
+API_KEY = os.environ.get("GEMINI_API_KEY", "")
+SECRET = os.environ.get("MCP_SECRET") or secrets.token_urlsafe(24)
+PUBLIC_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
+VIDEO_MODEL = os.environ.get("VIDEO_MODEL", "gemini-omni-1.1-flash")
+IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "gemini-nano-banana-2.1")
+BASE = "https://generativelanguage.googleapis.com/v1beta"
+DATA = Path(os.environ.get("DATA_DIR", "./data")); DATA.mkdir(parents=True, exist_ok=True)
+JOBS: dict[str, dict] = {}
+META_FILE = DATA / "meta.json"
+META: dict[str, dict] = json.loads(META_FILE.read_text()) if META_FILE.exists() else {}
+LOCK = threading.Lock()
+
+mcp = FastMCP(
+    "flowcast",
+    instructions=(
+        "Generate images (Nano Banana) and videos (Gemini Omni, the model behind Google Flow). "
+        "Workflow: optionally generate_image to build a first frame from a product photo, then start_video "
+        "with image_file_id, then poll get_video every ~20s until status is 'done'. Default aspect is 9:16."
+    ),
+    host="0.0.0.0",
+    port=int(os.environ.get("PORT", 8000)),
+    streamable_http_path=f"/mcp/{SECRET}",
+    stateless_http=True,
+    json_response=True,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
+
+# ---------------- helpers ----------------
+def _headers():
+    if not API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set on the server.")
+    return {"x-goog-api-key": API_KEY, "Content-Type": "application/json"}
+
+def _save(data: bytes, ext: str, kind: str, prompt: str) -> dict:
+    fid = uuid.uuid4().hex[:16]
+    name = f"{fid}.{ext}"
+    (DATA / name).write_bytes(data)
+    info = {"file_id": fid, "kind": kind, "filename": name, "url": f"{PUBLIC_URL}/files/{name}",
+            "prompt": prompt[:300], "bytes": len(data), "created": int(time.time())}
+    with LOCK:
+        META[fid] = info
+        META_FILE.write_text(json.dumps(META))
+    return info
+
+def _image_part(image_url: str | None, image_file_id: str | None) -> dict | None:
+    if image_file_id:
+        info = META.get(image_file_id)
+        if not info:
+            raise ValueError(f"Unknown file_id {image_file_id}")
+        raw = (DATA / info["filename"]).read_bytes()
+        mime = mimetypes.guess_type(info["filename"])[0] or "image/png"
+    elif image_url:
+        r = httpx.get(image_url, follow_redirects=True, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        raw = r.content
+        mime = r.headers.get("content-type", "image/jpeg").split(";")[0]
+        if not mime.startswith("image/"):
+            mime = "image/jpeg"
+    else:
+        return None
+    return {"type": "image", "data": base64.b64encode(raw).decode(), "mime_type": mime}
+
+def _find_media(obj, kind: str):
+    """Walk an Interactions API response and return the first {'type': kind, data|uri} content item."""
+    if isinstance(obj, dict):
+        if obj.get("type") == kind and ("data" in obj or "uri" in obj):
+            return obj
+        for v in obj.values():
+            hit = _find_media(v, kind)
+            if hit:
+                return hit
+    elif isinstance(obj, list):
+        for v in obj:
+            hit = _find_media(v, kind)
+            if hit:
+                return hit
+    return None
+
+def _interact(body: dict, timeout: float) -> dict:
+    r = httpx.post(f"{BASE}/interactions", headers=_headers(), json=body, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Gemini API error {r.status_code}: {r.text[:800]}")
+    return r.json()
+
+def _download_uri(uri: str) -> bytes:
+    file_id = uri.rstrip("/").split("/")[-1].split(":")[0]
+    for _ in range(180):  # up to ~15 min
+        info = httpx.get(f"{BASE}/files/{file_id}", headers=_headers(), timeout=60).json()
+        state = (info.get("state") or "").upper()
+        if state == "ACTIVE":
+            break
+        if state == "FAILED":
+            raise RuntimeError(f"Video processing failed: {json.dumps(info)[:500]}")
+        time.sleep(5)
+    r = httpx.get(f"{BASE}/files/{file_id}:download", params={"alt": "media"}, headers=_headers(),
+                  timeout=300, follow_redirects=True)
+    r.raise_for_status()
+    return r.content
+
+def _media_bytes(item: dict) -> bytes:
+    if item.get("data"):
+        return base64.b64decode(item["data"])
+    return _download_uri(item["uri"])
+
+# ---------------- tools ----------------
+@mcp.tool()
+def generate_image(prompt: str, reference_image_urls: list[str] | None = None,
+                   reference_file_ids: list[str] | None = None, aspect_ratio: str = "9:16") -> dict:
+    """Create or edit an image with Nano Banana. Pass product photos as reference_image_urls (public URLs)
+    or reference_file_ids (files on this server) to keep the exact product design.
+    aspect_ratio: '9:16', '16:9', '1:1', '4:5', '3:4'. Returns file_id and public url."""
+    parts = [{"type": "text", "text": prompt}]
+    for u in reference_image_urls or []:
+        parts.append(_image_part(u, None))
+    for f in reference_file_ids or []:
+        parts.append(_image_part(None, f))
+    resp = _interact({"model": IMAGE_MODEL, "input": parts,
+                      "response_format": {"type": "image", "aspect_ratio": aspect_ratio}}, timeout=240)
+    item = _find_media(resp, "image")
+    if not item:
+        raise RuntimeError(f"No image in response: {json.dumps(resp)[:800]}")
+    mime = item.get("mime_type", "image/png")
+    return _save(_media_bytes(item), "jpg" if "jpeg" in mime else "png", "image", prompt)
+
+def _run_video(job_id: str, body: dict, prompt: str):
+    try:
+        resp = _interact(body, timeout=900)
+        item = _find_media(resp, "video")
+        if not item:
+            raise RuntimeError(f"No video in response: {json.dumps(resp)[:800]}")
+        info = _save(_media_bytes(item), "mp4", "video", prompt)
+        info["interaction_id"] = resp.get("id")
+        JOBS[job_id].update(status="done", result=info, finished=int(time.time()))
+    except Exception as e:  # noqa: BLE001
+        JOBS[job_id].update(status="error", error=str(e)[:1500], finished=int(time.time()))
+
+def _start(body: dict, prompt: str) -> dict:
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = {"job_id": job_id, "status": "running", "started": int(time.time()), "prompt": prompt[:300]}
+    threading.Thread(target=_run_video, args=(job_id, body, prompt), daemon=True).start()
+    return {"job_id": job_id, "status": "running", "next": "Call get_video(job_id) every ~20 seconds."}
+
+@mcp.tool()
+def start_video(prompt: str, image_url: str | None = None, image_file_id: str | None = None,
+                aspect_ratio: str = "9:16", resolution: str = "720p") -> dict:
+    """Start generating a video clip (Gemini Omni Flash, the model behind Google Flow).
+    Text-to-video by default; pass image_url or image_file_id to animate a first frame (image-to-video).
+    aspect_ratio: '9:16' or '16:9'. resolution: '360p', '720p', '1080p', '4k'.
+    Returns a job_id. Poll get_video(job_id) until status is 'done'."""
+    content = [{"type": "text", "text": prompt}]
+    img = _image_part(image_url, image_file_id)
+    body = {"model": VIDEO_MODEL, "input": ([img] + content) if img else prompt,
+            "response_format": {"type": "video", "aspect_ratio": aspect_ratio,
+                                "resolution": resolution, "delivery": "uri"}}
+    if img:
+        body["generation_config"] = {"video_config": {"task": "image_to_video"}}
+    return _start(body, prompt)
+
+@mcp.tool()
+def extend_video(previous_file_id: str, prompt: str) -> dict:
+    """Continue a previously generated video (3–10 s more) with a new prompt. Returns a job_id."""
+    info = META.get(previous_file_id)
+    if not info or not info.get("interaction_id"):
+        raise ValueError("previous_file_id must be a video made by start_video on this server.")
+    body = {"model": VIDEO_MODEL, "input": prompt, "previous_interaction_id": info["interaction_id"],
+            "response_format": {"type": "video", "delivery": "uri"}}
+    return _start(body, prompt)
+
+@mcp.tool()
+def get_video(job_id: str) -> dict:
+    """Check a video job. status is 'running', 'done' (result.url is the MP4) or 'error'."""
+    job = JOBS.get(job_id)
+    if not job:
+        return {"job_id": job_id, "status": "unknown", "hint": "Server may have restarted; start again."}
+    out = dict(job)
+    if job["status"] == "running":
+        out["elapsed_s"] = int(time.time()) - job["started"]
+    return out
+
+@mcp.tool()
+def list_files(kind: str | None = None) -> list[dict]:
+    """List images/videos stored on this server, newest first. kind: 'image', 'video' or None for all."""
+    items = [m for m in META.values() if not kind or m["kind"] == kind]
+    return sorted(items, key=lambda m: m["created"], reverse=True)[:100]
+
+# ---------------- plain HTTP routes ----------------
+@mcp.custom_route("/", methods=["GET"])
+async def health(_: Request):
+    return PlainTextResponse("flowcast-mcp ok")
+
+@mcp.custom_route("/files/{name}", methods=["GET"])
+async def files(request: Request):
+    name = Path(request.path_params["name"]).name
+    p = DATA / name
+    if not p.exists() or name == "meta.json":
+        return PlainTextResponse("not found", status_code=404)
+    return FileResponse(p)
+
+UPLOAD_PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>FlowCast upload</title><body style="font-family:system-ui;max-width:520px;margin:40px auto;padding:0 16px">
+<h2>Upload product photos</h2><form method=post enctype=multipart/form-data>
+<input type=file name=file multiple accept="image/*"><br><br><button>Upload</button></form>
+<p>After uploading, tell Claude the file IDs shown (or say "use my latest uploads").</p></body>"""
+
+@mcp.custom_route(f"/upload/{SECRET}", methods=["GET", "POST"])
+async def upload(request: Request):
+    if request.method == "GET":
+        return HTMLResponse(UPLOAD_PAGE)
+    form = await request.form()
+    saved = []
+    for f in form.getlist("file"):
+        raw = await f.read()
+        ext = (Path(f.filename).suffix.lstrip(".") or "jpg").lower()
+        saved.append(_save(raw, ext, "image", f"upload: {f.filename}"))
+    return JSONResponse(saved)
+
+if __name__ == "__main__":
+    print(f"MCP endpoint:  {PUBLIC_URL}/mcp/{SECRET}")
+    print(f"Upload page:   {PUBLIC_URL}/upload/{SECRET}")
+    mcp.run(transport="streamable-http")
