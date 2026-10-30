@@ -9,6 +9,7 @@ An MCP server that gives Claude Google's Flow models through the official Gemini
 | Tool | What it does |
 |---|---|
 | `generate_image` | Prompt plus optional product photos → new image (9:16 by default) |
+| `create_video` | One call: optional first frame from product photo → finished MP4 (waits for it) |
 | `start_video` | Prompt plus optional first-frame image → background video job |
 | `get_video` | Poll a job; returns the MP4 URL when it's done |
 | `extend_video` | Continue a generated clip |

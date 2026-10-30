@@ -173,6 +173,38 @@ def start_video(prompt: str, image_url: str | None = None, image_file_id: str | 
     return _start(body, prompt)
 
 @mcp.tool()
+def create_video(prompt: str, image_prompt: str | None = None,
+                 reference_image_urls: list[str] | None = None,
+                 reference_file_ids: list[str] | None = None,
+                 aspect_ratio: str = "9:16", resolution: str = "720p",
+                 wait_s: int = 420) -> dict:
+    """Create a finished video in one call. Optionally pass image_prompt (plus product photos as
+    reference_image_urls or reference_file_ids) to first build the opening frame with Nano Banana,
+    which is then animated; otherwise the video is generated straight from prompt (text-to-video).
+    Waits up to wait_s seconds for the result. If still rendering when time runs out, returns the
+    job_id with status 'running' — finish with get_video(job_id). On success result.url is the MP4."""
+    first_frame = None
+    if image_prompt or reference_image_urls or reference_file_ids:
+        first_frame = generate_image(image_prompt or prompt, reference_image_urls,
+                                     reference_file_ids, aspect_ratio)
+    job = start_video(prompt, image_file_id=first_frame["file_id"] if first_frame else None,
+                      aspect_ratio=aspect_ratio, resolution=resolution)
+    deadline = time.time() + max(30, min(wait_s, 840))
+    while time.time() < deadline:
+        state = JOBS.get(job["job_id"], {})
+        if state.get("status") in ("done", "error"):
+            out = dict(state)
+            if first_frame:
+                out["first_frame"] = first_frame
+            return out
+        time.sleep(5)
+    out = {"job_id": job["job_id"], "status": "running",
+           "next": "Still rendering. Call get_video(job_id) every ~20 seconds."}
+    if first_frame:
+        out["first_frame"] = first_frame
+    return out
+
+@mcp.tool()
 def extend_video(previous_file_id: str, prompt: str) -> dict:
     """Continue a previously generated video (3–10 s more) with a new prompt. Returns a job_id."""
     info = META.get(previous_file_id)
