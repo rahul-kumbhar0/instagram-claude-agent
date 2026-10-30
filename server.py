@@ -1,4 +1,7 @@
-"""FlowCast MCP: Google's Flow models (Gemini Omni video + Nano Banana images) as an MCP server for Claude.
+"""FlowCast MCP: image and video generation as an MCP server for Claude.
+
+PROVIDER=gemini uses Google's Flow models (Gemini Omni video + Nano Banana images).
+PROVIDER=hf uses free open-source models on Hugging Face Spaces (Wan 2.2 video + FLUX images).
 
 Tools: generate_image, start_video, get_video, list_files, extend_video.
 Generated files are saved on this server and served at /files/<id>.<ext>.
@@ -8,6 +11,7 @@ import base64, json, os, secrets, threading, time, uuid, mimetypes
 from pathlib import Path
 
 import httpx
+import hf_provider
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -19,6 +23,7 @@ SECRET = os.environ.get("MCP_SECRET") or secrets.token_urlsafe(24)
 PUBLIC_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
 VIDEO_MODEL = os.environ.get("VIDEO_MODEL", "gemini-omni-1.1-flash")
 IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "gemini-nano-banana-2.1")
+PROVIDER = os.environ.get("PROVIDER", "gemini").lower()
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 DATA = Path(os.environ.get("DATA_DIR", "./data")); DATA.mkdir(parents=True, exist_ok=True)
 JOBS: dict[str, dict] = {}
@@ -76,6 +81,21 @@ def _image_part(image_url: str | None, image_file_id: str | None) -> dict | None
         return None
     return {"type": "image", "data": base64.b64encode(raw).decode(), "mime_type": mime}
 
+def _local_image(image_url: str | None, image_file_id: str | None) -> str | None:
+    if image_file_id:
+        info = META.get(image_file_id)
+        if not info:
+            raise ValueError(f"Unknown file_id {image_file_id}")
+        return str(DATA / info["filename"])
+    if image_url:
+        r = httpx.get(image_url, follow_redirects=True, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        ext = (mimetypes.guess_extension(r.headers.get("content-type", "").split(";")[0]) or ".jpg")
+        path = DATA / f"in-{uuid.uuid4().hex[:12]}{ext}"
+        path.write_bytes(r.content)
+        return str(path)
+    return None
+
 def _find_media(obj, kind: str):
     """Walk an Interactions API response and return the first {'type': kind, data|uri} content item."""
     if isinstance(obj, dict):
@@ -124,7 +144,13 @@ def generate_image(prompt: str, reference_image_urls: list[str] | None = None,
                    reference_file_ids: list[str] | None = None, aspect_ratio: str = "9:16") -> dict:
     """Create or edit an image with Nano Banana. Pass product photos as reference_image_urls (public URLs)
     or reference_file_ids (files on this server) to keep the exact product design.
-    aspect_ratio: '9:16', '16:9', '1:1', '4:5', '3:4'. Returns file_id and public url."""
+    aspect_ratio: '9:16', '16:9', '1:1', '4:5', '3:4'. Returns file_id and public url.
+    With the free Hugging Face provider (FLUX), reference photos are not used; the image comes from the prompt."""
+    if PROVIDER == "hf":
+        data, ext, space = hf_provider.run("image", prompt, aspect_ratio=aspect_ratio)
+        info = _save(data, ext, "image", prompt)
+        info["model"] = space
+        return info
     parts = [{"type": "text", "text": prompt}]
     for u in reference_image_urls or []:
         parts.append(_image_part(u, None))
@@ -150,6 +176,31 @@ def _run_video(job_id: str, body: dict, prompt: str):
     except Exception as e:  # noqa: BLE001
         JOBS[job_id].update(status="error", error=str(e)[:1500], finished=int(time.time()))
 
+def _run_fn(job_id: str, fn):
+    try:
+        JOBS[job_id].update(status="done", result=fn(), finished=int(time.time()))
+    except Exception as e:  # noqa: BLE001
+        JOBS[job_id].update(status="error", error=str(e)[:1500], finished=int(time.time()))
+
+def _start_fn(fn, prompt: str) -> dict:
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = {"job_id": job_id, "status": "running", "started": int(time.time()), "prompt": prompt[:300]}
+    threading.Thread(target=_run_fn, args=(job_id, fn), daemon=True).start()
+    return {"job_id": job_id, "status": "running", "next": "Call get_video(job_id) every ~20 seconds."}
+
+def _hf_video(prompt: str, image_url: str | None, image_file_id: str | None, aspect_ratio: str) -> dict:
+    path = _local_image(image_url, image_file_id)
+    first_frame = None
+    if not path:
+        first_frame = generate_image(prompt, aspect_ratio=aspect_ratio)
+        path = str(DATA / first_frame["filename"])
+    data, ext, space = hf_provider.run("video", prompt, image_path=path)
+    info = _save(data, ext or "mp4", "video", prompt)
+    info["model"] = space
+    if first_frame:
+        info["first_frame"] = first_frame
+    return info
+
 def _start(body: dict, prompt: str) -> dict:
     job_id = uuid.uuid4().hex[:12]
     JOBS[job_id] = {"job_id": job_id, "status": "running", "started": int(time.time()), "prompt": prompt[:300]}
@@ -162,7 +213,11 @@ def start_video(prompt: str, image_url: str | None = None, image_file_id: str | 
     """Start generating a video clip (Gemini Omni Flash, the model behind Google Flow).
     Text-to-video by default; pass image_url or image_file_id to animate a first frame (image-to-video).
     aspect_ratio: '9:16' or '16:9'. resolution: '360p', '720p', '1080p', '4k'.
-    Returns a job_id. Poll get_video(job_id) until status is 'done'."""
+    Returns a job_id. Poll get_video(job_id) until status is 'done'.
+    With the free Hugging Face provider (Wan 2.2), a first frame is generated automatically when no image
+    is given, and aspect ratio follows the image."""
+    if PROVIDER == "hf":
+        return _start_fn(lambda: _hf_video(prompt, image_url, image_file_id, aspect_ratio), prompt)
     content = [{"type": "text", "text": prompt}]
     img = _image_part(image_url, image_file_id)
     body = {"model": VIDEO_MODEL, "input": ([img] + content) if img else prompt,
@@ -184,10 +239,15 @@ def create_video(prompt: str, image_prompt: str | None = None,
     Waits up to wait_s seconds for the result. If still rendering when time runs out, returns the
     job_id with status 'running' — finish with get_video(job_id). On success result.url is the MP4."""
     first_frame = None
-    if image_prompt or reference_image_urls or reference_file_ids:
+    if image_prompt or ((reference_image_urls or reference_file_ids) and PROVIDER != "hf"):
         first_frame = generate_image(image_prompt or prompt, reference_image_urls,
                                      reference_file_ids, aspect_ratio)
-    job = start_video(prompt, image_file_id=first_frame["file_id"] if first_frame else None,
+    frame_id = first_frame["file_id"] if first_frame else None
+    frame_url = None
+    if not first_frame and PROVIDER == "hf":
+        frame_id = (reference_file_ids or [None])[0]
+        frame_url = None if frame_id else (reference_image_urls or [None])[0]
+    job = start_video(prompt, image_url=frame_url, image_file_id=frame_id,
                       aspect_ratio=aspect_ratio, resolution=resolution)
     deadline = time.time() + max(30, min(wait_s, 840))
     while time.time() < deadline:
@@ -207,6 +267,8 @@ def create_video(prompt: str, image_prompt: str | None = None,
 @mcp.tool()
 def extend_video(previous_file_id: str, prompt: str) -> dict:
     """Continue a previously generated video (3–10 s more) with a new prompt. Returns a job_id."""
+    if PROVIDER == "hf":
+        raise ValueError("extend_video is only available with PROVIDER=gemini.")
     info = META.get(previous_file_id)
     if not info or not info.get("interaction_id"):
         raise ValueError("previous_file_id must be a video made by start_video on this server.")

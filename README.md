@@ -49,3 +49,14 @@ in your cloud environment settings and make sure the network policy allows
 - The free plan sleeps after 15 minutes idle, and the first request after that takes about 1 minute.
 - API usage is billed by Google per generation. It is separate from your Flow subscription credits.
 - Override models with the `VIDEO_MODEL` and `IMAGE_MODEL` env vars if Google renames them.
+
+## Free open-source provider (Hugging Face)
+Set `PROVIDER=hf` and `HF_TOKEN` (from https://huggingface.co/settings/tokens) to use free
+open-source models on Hugging Face ZeroGPU Spaces instead of Gemini:
+
+- Images: FLUX.1-schnell (`HF_IMAGE_SPACES`)
+- Videos: Wan 2.2 image-to-video (`HF_VIDEO_SPACES`, comma-separated, tried in order)
+
+Same tools, no code changes. Notes: free Hugging Face accounts get a small daily GPU quota
+(a few short clips); busy Spaces queue; FLUX ignores reference photos, but a product photo
+passed to `start_video`/`create_video` is animated directly; `extend_video` is Gemini-only.
