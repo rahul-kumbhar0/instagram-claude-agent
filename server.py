@@ -3,7 +3,7 @@
 PROVIDER=gemini uses Google's Flow models (Gemini Omni video + Nano Banana images).
 PROVIDER=hf uses free open-source models on Hugging Face Spaces (Wan 2.2 video + FLUX images).
 
-Tools: generate_image, start_video, get_video, list_files, extend_video.
+Tools: create_video, generate_image, start_video, get_video, join_videos, list_files, extend_video.
 Generated files are saved on this server and served at /files/<id>.<ext>.
 The MCP endpoint is /mcp/<MCP_SECRET>; keep that URL private.
 """
@@ -12,11 +12,13 @@ from pathlib import Path
 
 import httpx
 import hf_provider
+import reel
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 SECRET = os.environ.get("MCP_SECRET") or secrets.token_urlsafe(24)
@@ -293,6 +295,27 @@ def list_files(kind: str | None = None) -> list[dict]:
     items = [m for m in META.values() if not kind or m["kind"] == kind]
     return sorted(items, key=lambda m: m["created"], reverse=True)[:100]
 
+@mcp.tool()
+def join_videos(file_ids: list[str], title: str | None = None) -> dict:
+    """Join video clips (file_ids, in order) into one 9:16 reel at 720x1280. Optional title is shown
+    in bold yellow over the first 2.5 seconds. Returns the reel's file_id and url."""
+    if len(file_ids) < 2:
+        raise ValueError("Pass at least two video file_ids.")
+    paths = []
+    for fid in file_ids:
+        info = META.get(fid)
+        if not info or info.get("kind") != "video":
+            raise ValueError(f"{fid} is not a video on this server.")
+        paths.append(str(DATA / info["filename"]))
+    out = DATA / f"tmp-reel-{uuid.uuid4().hex[:12]}.mp4"
+    try:
+        reel.join(paths, str(out), title)
+        info = _save(out.read_bytes(), "mp4", "video", f"reel ({title or 'untitled'}): {', '.join(file_ids)}")
+    finally:
+        out.unlink(missing_ok=True)
+    info["clips"] = file_ids
+    return info
+
 # ---------------- plain HTTP routes ----------------
 @mcp.custom_route("/", methods=["GET"])
 async def health(_: Request):
@@ -305,6 +328,52 @@ async def files(request: Request):
     if not p.exists() or name == "meta.json":
         return PlainTextResponse("not found", status_code=404)
     return FileResponse(p)
+
+@mcp.custom_route(f"/reel/{SECRET}", methods=["GET"])
+async def reel_route(request: Request):
+    ids = [i.strip() for i in request.query_params.get("ids", "").split(",") if i.strip()]
+    try:
+        info = await run_in_threadpool(join_videos, ids, request.query_params.get("title"))
+    except Exception as e:  # noqa: BLE001
+        return PlainTextResponse(f"Could not build reel: {e}", status_code=400)
+    return RedirectResponse(info["url"], status_code=302)
+
+def _carry_over_files():
+    """On Render, the previous instance keeps serving until this one opens its port, and each
+    instance has its own temporary disk. Copy the previous instance's files before starting."""
+    if not PUBLIC_URL.startswith("https://"):
+        return
+    try:
+        r = httpx.post(f"{PUBLIC_URL}/mcp/{SECRET}", timeout=15,
+                       headers={"Accept": "application/json, text/event-stream"},
+                       json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                             "params": {"name": "list_files", "arguments": {}}})
+        result = r.json().get("result", {})
+        items = (result.get("structuredContent") or {}).get("result")
+        if items is None:
+            items = []
+            for c in result.get("content", []):
+                v = json.loads(c.get("text", "null"))
+                items.extend(v if isinstance(v, list) else [v])
+    except Exception as e:  # noqa: BLE001
+        print(f"No previous instance to copy files from ({type(e).__name__}).")
+        return
+    copied = 0
+    for info in items:
+        if not isinstance(info, dict) or not info.get("file_id") or not info.get("filename"):
+            continue
+        name = Path(info["filename"]).name
+        if not (DATA / name).exists():
+            try:
+                f = httpx.get(f"{PUBLIC_URL}/files/{name}", timeout=60)
+                f.raise_for_status()
+                (DATA / name).write_bytes(f.content)
+                copied += 1
+            except Exception:  # noqa: BLE001
+                continue
+        META[info["file_id"]] = info
+    META_FILE.write_text(json.dumps(META))
+    print(f"Copied {copied} files from the previous instance ({len(items)} listed).")
 
 UPLOAD_PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>FlowCast upload</title><body style="font-family:system-ui;max-width:520px;margin:40px auto;padding:0 16px">
@@ -325,6 +394,7 @@ async def upload(request: Request):
     return JSONResponse(saved)
 
 if __name__ == "__main__":
+    _carry_over_files()
     print(f"MCP endpoint:  {PUBLIC_URL}/mcp/{SECRET}")
     print(f"Upload page:   {PUBLIC_URL}/upload/{SECRET}")
     mcp.run(transport="streamable-http")

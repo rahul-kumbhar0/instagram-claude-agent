@@ -60,3 +60,11 @@ open-source models on Hugging Face ZeroGPU Spaces instead of Gemini:
 Same tools, no code changes. Notes: free Hugging Face accounts get a small daily GPU quota
 (a few short clips); busy Spaces queue; FLUX ignores reference photos, but a product photo
 passed to `start_video`/`create_video` is animated directly; `extend_video` is Gemini-only.
+
+## Reels
+`join_videos(file_ids, title)` joins clips in order into one 720x1280 reel, with an optional
+yellow title over the first 2.5 seconds. The same is available in a browser:
+`https://<your-service>.onrender.com/reel/<MCP_SECRET>?ids=<id1>,<id2>,...&title=My%20Haul`
+
+On redeploy, the new instance copies files from the previous one before it starts, so
+clips survive deploys (they are still lost when the free service sleeps).
