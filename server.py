@@ -301,6 +301,19 @@ def join_videos(file_ids: list[str], title: str | None = None) -> dict:
     in bold yellow over the first 2.5 seconds. Returns the reel's file_id and url."""
     if len(file_ids) < 2:
         raise ValueError("Pass at least two video file_ids.")
+    key = f"{','.join(file_ids)}|{title or ''}"
+    with REEL_LOCK:
+        cached = META.get(REELS.get(key, ""))
+        if cached and (DATA / cached["filename"]).exists():
+            return cached
+        info = _join_videos(file_ids, title)
+        REELS[key] = info["file_id"]
+        return info
+
+REEL_LOCK = threading.Lock()
+REELS: dict[str, str] = {}
+
+def _join_videos(file_ids: list[str], title: str | None) -> dict:
     paths = []
     for fid in file_ids:
         info = META.get(fid)
@@ -314,6 +327,8 @@ def join_videos(file_ids: list[str], title: str | None = None) -> dict:
     finally:
         out.unlink(missing_ok=True)
     info["clips"] = file_ids
+    with LOCK:
+        META[info["file_id"]]["clips"] = file_ids
     return info
 
 # ---------------- plain HTTP routes ----------------
