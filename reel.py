@@ -11,20 +11,42 @@ ENCODE = ["-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_f
           "-threads", "1", "-x264-params", "rc-lookahead=10", "-video_track_timescale", "12288"]
 
 
-def _title_png(text: str, path: Path) -> None:
-    from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    size = 84
-    while True:
-        font = ImageFont.load_default(size=size)
-        box = draw.textbbox((0, 0), text, font=font, stroke_width=6)
-        if box[2] - box[0] <= W - 80 or size <= 36:
-            break
-        size -= 6
-    draw.text((50, int(H * 0.12)), text, font=font, fill=(255, 214, 10, 255),
-              stroke_width=6, stroke_fill=(20, 20, 20, 255))
-    img.save(path)
+def _font(size: int):
+    from PIL import ImageFont
+    return ImageFont.load_default(size=size)
+
+
+def _title_frames(title: str, subtitle: str | None, folder: Path, seconds: float) -> None:
+    """Write one transparent PNG per frame: the title types in letter by letter, then holds,
+    and the subtitle appears once the title is complete."""
+    from PIL import Image, ImageDraw
+    probe = ImageDraw.Draw(Image.new("RGBA", (W, H)))
+    size = 80
+    while size > 36 and probe.textbbox((0, 0), title, font=_font(size), stroke_width=3)[2] > W - 70:
+        size -= 4
+    font, sub_font = _font(size), _font(max(28, size // 2))
+    x, y = 36, int(H * 0.11)
+    type_frames = max(1, min(int(FPS * 1.2), len(title) * 2))
+    cache: dict[tuple[int, bool], Image.Image] = {}
+    for f in range(int(seconds * FPS)):
+        n = min(len(title), 1 + f * len(title) // type_frames)
+        show_sub = bool(subtitle) and n == len(title)
+        key = (n, show_sub)
+        if key not in cache:
+            img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            text = title[:n]
+            d.text((x + 4, y + 5), text, font=font, fill=(25, 20, 10, 200), stroke_width=3,
+                   stroke_fill=(25, 20, 10, 200))
+            d.text((x, y), text, font=font, fill=(255, 221, 0, 255), stroke_width=2,
+                   stroke_fill=(255, 221, 0, 255))
+            if show_sub:
+                full = d.textbbox((x, y), title, font=font, stroke_width=2)
+                sw = d.textlength(subtitle, font=sub_font)
+                d.text(((full[0] + full[2] - sw) / 2, full[3] + 6), subtitle, font=sub_font,
+                       fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(20, 20, 20, 255))
+            cache[key] = img
+        cache[key].save(folder / f"t{f:04d}.png")
 
 
 def _run(args: list[str]) -> None:
@@ -33,7 +55,8 @@ def _run(args: list[str]) -> None:
         raise RuntimeError(f"ffmpeg failed: {r.stderr[-1200:]}")
 
 
-def join(paths: list[str], out_path: str, title: str | None = None, title_seconds: float = 2.5) -> None:
+def join(paths: list[str], out_path: str, title: str | None = None, title_seconds: float = 3.5,
+         subtitle: str | None = None) -> None:
     import imageio_ffmpeg
     ff = imageio_ffmpeg.get_ffmpeg_exe()
     norm = (f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
@@ -44,11 +67,12 @@ def join(paths: list[str], out_path: str, title: str | None = None, title_second
             seg = str(Path(tmp) / f"seg{i}.mp4")
             args = [ff, "-y", "-loglevel", "error", "-threads", "1", "-i", src]
             if i == 0 and title:
-                png = Path(tmp) / "title.png"
-                _title_png(title, png)
-                args += ["-loop", "1", "-i", str(png), "-filter_complex",
+                frames = Path(tmp) / "title"
+                frames.mkdir()
+                _title_frames(title, subtitle, frames, title_seconds)
+                args += ["-framerate", str(FPS), "-i", str(frames / "t%04d.png"), "-filter_complex",
                          f"[0:v]{norm}[v];[1:v]format=rgba[t];"
-                         f"[v][t]overlay=0:0:enable='lt(t,{title_seconds})':shortest=1[out]",
+                         f"[v][t]overlay=0:0:eof_action=pass[out]",
                          "-map", "[out]"]
             else:
                 args += ["-vf", norm]

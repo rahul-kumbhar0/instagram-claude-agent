@@ -98,6 +98,19 @@ def _local_image(image_url: str | None, image_file_id: str | None) -> str | None
         return str(path)
     return None
 
+def _pad_to(path: str, aspect_ratio: str) -> str:
+    """Center the photo on a canvas of the target aspect, filled with a blurred copy of itself."""
+    from PIL import Image, ImageFilter
+    w, h = hf_provider.SIZES.get(aspect_ratio, hf_provider.SIZES["9:16"])
+    img = Image.open(path).convert("RGB")
+    bg = img.resize((w, h)).filter(ImageFilter.GaussianBlur(40))
+    fit = img.copy()
+    fit.thumbnail((w, h))
+    bg.paste(fit, ((w - fit.width) // 2, (h - fit.height) // 2))
+    out = DATA / f"in-{uuid.uuid4().hex[:12]}.png"
+    bg.save(out)
+    return str(out)
+
 def _find_media(obj, kind: str):
     """Walk an Interactions API response and return the first {'type': kind, data|uri} content item."""
     if isinstance(obj, dict):
@@ -147,9 +160,17 @@ def generate_image(prompt: str, reference_image_urls: list[str] | None = None,
     """Create or edit an image with Nano Banana. Pass product photos as reference_image_urls (public URLs)
     or reference_file_ids (files on this server) to keep the exact product design.
     aspect_ratio: '9:16', '16:9', '1:1', '4:5', '3:4'. Returns file_id and public url.
-    With the free Hugging Face provider (FLUX), reference photos are not used; the image comes from the prompt."""
+    With the free Hugging Face provider, a reference photo is edited with FLUX.1 Kontext (the first
+    reference is used; the product stays the same while the scene changes); without one, FLUX.1-schnell
+    draws the image from the prompt."""
     if PROVIDER == "hf":
-        data, ext, space = hf_provider.run("image", prompt, aspect_ratio=aspect_ratio)
+        ref = (reference_file_ids or [None])[0]
+        ref_url = None if ref else (reference_image_urls or [None])[0]
+        if ref or ref_url:
+            src = _local_image(ref_url, ref)
+            data, ext, space = hf_provider.run("edit", prompt, image_path=_pad_to(src, aspect_ratio))
+        else:
+            data, ext, space = hf_provider.run("image", prompt, aspect_ratio=aspect_ratio)
         info = _save(data, ext, "image", prompt)
         info["model"] = space
         return info
@@ -296,24 +317,25 @@ def list_files(kind: str | None = None) -> list[dict]:
     return sorted(items, key=lambda m: m["created"], reverse=True)[:100]
 
 @mcp.tool()
-def join_videos(file_ids: list[str], title: str | None = None) -> dict:
-    """Join video clips (file_ids, in order) into one 9:16 reel at 720x1280. Optional title is shown
-    in bold yellow over the first 2.5 seconds. Returns the reel's file_id and url."""
+def join_videos(file_ids: list[str], title: str | None = None, subtitle: str | None = None) -> dict:
+    """Join video clips (file_ids, in order) into one 9:16 reel at 720x1280. An optional title types
+    in letter by letter in bold yellow over the opening seconds, with an optional small white subtitle
+    under it (e.g. 'for you'). Returns the reel's file_id and url."""
     if len(file_ids) < 2:
         raise ValueError("Pass at least two video file_ids.")
-    key = f"{','.join(file_ids)}|{title or ''}"
+    key = f"{','.join(file_ids)}|{title or ''}|{subtitle or ''}"
     with REEL_LOCK:
         cached = META.get(REELS.get(key, ""))
         if cached and (DATA / cached["filename"]).exists():
             return cached
-        info = _join_videos(file_ids, title)
+        info = _join_videos(file_ids, title, subtitle)
         REELS[key] = info["file_id"]
         return info
 
 REEL_LOCK = threading.Lock()
 REELS: dict[str, str] = {}
 
-def _join_videos(file_ids: list[str], title: str | None) -> dict:
+def _join_videos(file_ids: list[str], title: str | None, subtitle: str | None = None) -> dict:
     paths = []
     for fid in file_ids:
         info = META.get(fid)
@@ -322,7 +344,7 @@ def _join_videos(file_ids: list[str], title: str | None) -> dict:
         paths.append(str(DATA / info["filename"]))
     out = DATA / f"tmp-reel-{uuid.uuid4().hex[:12]}.mp4"
     try:
-        reel.join(paths, str(out), title)
+        reel.join(paths, str(out), title, subtitle=subtitle)
         info = _save(out.read_bytes(), "mp4", "video", f"reel ({title or 'untitled'}): {', '.join(file_ids)}")
     finally:
         out.unlink(missing_ok=True)
@@ -348,7 +370,8 @@ async def files(request: Request):
 async def reel_route(request: Request):
     ids = [i.strip() for i in request.query_params.get("ids", "").split(",") if i.strip()]
     try:
-        info = await run_in_threadpool(join_videos, ids, request.query_params.get("title"))
+        info = await run_in_threadpool(join_videos, ids, request.query_params.get("title"),
+                                       request.query_params.get("subtitle"))
     except Exception as e:  # noqa: BLE001
         return PlainTextResponse(f"Could not build reel: {e}", status_code=400)
     return RedirectResponse(info["url"], status_code=302)

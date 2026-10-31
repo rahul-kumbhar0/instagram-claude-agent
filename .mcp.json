@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "flowcast": {
-      "type": "http",
-      "url": "${FLOWCAST_MCP_URL}"
-    }
-  }
-}

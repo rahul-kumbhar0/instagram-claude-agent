@@ -1,6 +1,7 @@
 """Free open-source generation through Hugging Face Spaces (ZeroGPU).
 
-Images: FLUX.1-schnell. Videos: Wan 2.2 image-to-video.
+Images: FLUX.1-schnell. Image edits (product photo -> new scene): FLUX.1 Kontext.
+Videos: Wan 2.2 image-to-video.
 Each Space's API is read at runtime, so inputs are matched by name and type rather than
 hard-coded positions. Spaces are tried in order until one succeeds.
 """
@@ -14,8 +15,9 @@ def _spaces(var: str, default: str) -> list[str]:
 IMAGE_SPACES = _spaces("HF_IMAGE_SPACES", "black-forest-labs/FLUX.1-schnell")
 VIDEO_SPACES = _spaces(
     "HF_VIDEO_SPACES",
-    "zerogpu-aoti/wan2-2-fp8da-aoti-faster,r3gm/wan2-2-fp8da-aoti-preview,Wan-AI/Wan-2.2-5B",
+    "zerogpu-aoti/wan2-2-fp8da-aoti-faster,r3gm/wan2-2-fp8da-aoti-preview",
 )
+EDIT_SPACES = _spaces("HF_EDIT_SPACES", "black-forest-labs/FLUX.1-Kontext-Dev")
 SIZES = {"9:16": (576, 1024), "16:9": (1024, 576), "1:1": (1024, 1024),
          "4:5": (832, 1024), "3:4": (768, 1024)}
 VIDEO_EXTS = (".mp4", ".webm", ".mov", ".mkv")
@@ -49,6 +51,10 @@ def _pick(endpoints: dict, want: str):
             if not any(_comp(r) == "video" for r in rets):
                 continue
             score = 2 + (2 if has_img else 0)
+        elif want == "edit":
+            if not has_img or not any(_comp(r) in ("image", "gallery") for r in rets):
+                continue
+            score = 3
         else:
             if not any(_comp(r) in ("image", "gallery") for r in rets):
                 continue
@@ -112,7 +118,7 @@ def _find_file(res, exts):
 def run(want: str, prompt: str, image_path: str | None = None,
         aspect_ratio: str = "9:16") -> tuple[bytes, str, str]:
     """Generate with the first working Space. Returns (bytes, extension, space_id)."""
-    spaces = VIDEO_SPACES if want == "video" else IMAGE_SPACES
+    spaces = {"video": VIDEO_SPACES, "edit": EDIT_SPACES}.get(want, IMAGE_SPACES)
     exts = VIDEO_EXTS if want == "video" else IMAGE_EXTS
     size = SIZES.get(aspect_ratio, SIZES["9:16"]) if want == "image" else None
     errors = []
@@ -126,7 +132,7 @@ def run(want: str, prompt: str, image_path: str | None = None,
                 errors.append(f"{space}: no {want} endpoint among {list(endpoints)}")
                 continue
             name, ep = picked
-            if want == "video" and image_path is None and any(
+            if want in ("video", "edit") and image_path is None and any(
                     _comp(p) == "image" and not p.get("parameter_has_default")
                     for p in ep.get("parameters", [])):
                 errors.append(f"{space}: needs a first-frame image")

@@ -24,31 +24,13 @@ An MCP server that gives Claude Google's Flow models through the official Gemini
 5. Upload product photos at `https://<your-service>.onrender.com/upload/<MCP_SECRET>`.
 
 ## Connect to Claude Code
-This repo ships a `.mcp.json` that points Claude Code at the server via the
-`FLOWCAST_MCP_URL` environment variable (so the secret never lands in git).
-
-Set the variable to your full MCP URL, then start Claude Code in this repo:
-
-```bash
-export FLOWCAST_MCP_URL="https://<your-service>.onrender.com/mcp/<MCP_SECRET>"
-```
-
-Or register it globally for your user instead:
+Register the server once for your user (keep the URL private, it contains the secret):
 
 ```bash
 claude mcp add --transport http --scope user flowcast "https://<your-service>.onrender.com/mcp/<MCP_SECRET>"
 ```
 
-For Claude Code on the web (cloud sessions), add `FLOWCAST_MCP_URL` as a secret
-in your cloud environment settings and make sure the network policy allows
-`<your-service>.onrender.com`. Verify the connection with `/mcp` inside Claude Code.
-
-## Notes
-- Keep the MCP URL private: the secret in the path is the only lock.
-- Render's free disk is temporary. Files disappear on redeploy or sleep, so download finished clips.
-- The free plan sleeps after 15 minutes idle, and the first request after that takes about 1 minute.
-- API usage is billed by Google per generation. It is separate from your Flow subscription credits.
-- Override models with the `VIDEO_MODEL` and `IMAGE_MODEL` env vars if Google renames them.
+On claude.ai, add the same URL under Settings → Connectors → Add custom connector. Verify with `/mcp`.
 
 ## Free open-source provider (Hugging Face)
 Set `PROVIDER=hf` and `HF_TOKEN` (from https://huggingface.co/settings/tokens) to use free
@@ -68,3 +50,9 @@ yellow title over the first 2.5 seconds. The same is available in a browser:
 
 On redeploy, the new instance copies files from the previous one before it starts, so
 clips survive deploys (they are still lost when the free service sleeps).
+
+## Fashion haul reels (skill)
+`.claude/skills/fashion-haul-reel/SKILL.md` is the recipe Claude follows to turn real discounted
+products into a parcel-unboxing + hanger-showcase reel. With `PROVIDER=hf`, `generate_image` with a
+reference photo uses FLUX.1 Kontext (`HF_EDIT_SPACES`) to put the exact product into a new scene,
+and `join_videos(title, subtitle)` types the title in letter by letter.
